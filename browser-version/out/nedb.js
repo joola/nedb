@@ -601,8 +601,9 @@ process.chdir = function (dir) {
 /**
  * Manage access to data, be it to find, update or remove it
  */
-var model = require('./model'),
-  async = require('async');
+var model = require('./model');
+
+ 
 
 /**
  * Create a new cursor for this collection
@@ -610,26 +611,26 @@ var model = require('./model'),
  * @param {Query} query - The query this cursor will operate on
  * @param {Function} execDn - Handler to be executed  after cursor has found the results and before the callback passed to find/findOne/update/remove
  */
-function Cursor(db, query, execFn) {
+function Cursor (db, query, execFn) {
   this.db = db;
   this.query = query || {};
-  if (execFn) {
-    this.execFn = execFn;
-  }
+  if (execFn) { this.execFn = execFn; }
 }
+
 
 /**
  * Set a limit to the number of results
  */
-Cursor.prototype.limit = function (limit) {
+Cursor.prototype.limit = function(limit) {
   this._limit = limit;
   return this;
 };
 
+
 /**
  * Skip a the number of results
  */
-Cursor.prototype.skip = function (skip) {
+Cursor.prototype.skip = function(skip) {
   this._skip = skip;
   return this;
 };
@@ -646,10 +647,11 @@ Cursor.prototype.group = function (group) {
  * Sort results of the query
  * @Param {SortQuery} sortQuery - SortQuery is { field: order }, field can use the dot-notation, order is 1 for ascending and -1 for descending
  */
-Cursor.prototype.sort = function (sortQuery) {
+Cursor.prototype.sort = function(sortQuery) {
   this._sort = sortQuery;
   return this;
 };
+
 
 /**
  * Get all matching elements
@@ -658,123 +660,89 @@ Cursor.prototype.sort = function (sortQuery) {
  *
  * @param {Function} callback - Signature: err, results
  */
-Cursor.prototype._exec = function (callback) {
-  var candidates = this.db.getCandidates(this.query),
-    res = [],
-    added = 0,
-    skipped = 0,
-    self = this,
-    i, keys, key;
-
-  if (this._group) {
-    async.waterfall([
-
-      function (next) {
-        async.each(candidates, function (cand, done) {
-          try {
-            if (model.match(cand, self.query)) {
-              res.push(cand);
-            }
-            done();
-          } catch (err) {
-            done(err);
-          }
-        }, function (err) {
-          next(err, res);
-        });
-      },
-      function (coll, next) {
-        var res = [];
-        //TODO: group stuff
-        return next(null, res);
-      },
-      function (coll, next) {
-        if (self._sort) {
-          keys = Object.keys(self._sort);
-
-          // Going backwards so that the first sort is the last that gets applied
-          for (i = keys.length - 1; i >= 0; i -= 1) {
-            key = keys[i];
-            coll.sort(function (a, b) {
-              return self._sort[key] * model.compareThings(model.getDotValue(a, key), model.getDotValue(b, key));
-            });
-          }
-        }
-        next(null, coll);
-      },
-      function (coll, next) {
-        next(null, coll.slice(self._skip || 0, self._limit || coll.length));
-      }
-    ], function (err, res) {
-      if (self.execFn) {
-        return self.execFn(err, res, callback);
-      } else {
-        return callback(err, res);
-      }
-    });
-  } else {
-
-    try {
-      for (i = 0; i < candidates.length; i += 1) {
-        if (model.match(candidates[i], this.query)) {
-          // If a sort is defined, wait for the results to be sorted before applying limit and skip
-          if (!this._sort) {
-            if (this._skip && this._skip > skipped) {
-              skipped += 1;
-            } else {
-              res.push(candidates[i]);
-              added += 1;
-              if (this._limit && this._limit <= added) {
-                break;
-              }
-            }
+Cursor.prototype._exec = function(callback) {
+  var candidates = this.db.getCandidates(this.query)
+    , res = [], added = 0, skipped = 0, self = this
+    , i, keys, key
+    ;
+  
+  try {
+    for (i = 0; i < candidates.length; i += 1) {
+      if (model.match(candidates[i], this.query)) {
+        // If a sort is defined, wait for the results to be sorted before applying limit and skip
+        if (!this._sort && !this._group) {
+          if (this._skip && this._skip > skipped) {
+            skipped += 1;
           } else {
             res.push(candidates[i]);
+            added += 1;
+            if (this._limit && this._limit <= added) { break; }                  
           }
+        } else {
+          res.push(candidates[i]);
         }
       }
+    }
+  } catch (err) {
+    return callback(err);
+  }
+
+  //Apply grouping
+  if (this._group) {
+    try {
+      res = model.aggregate(res, this._group);
     } catch (err) {
       return callback(err);
     }
+  }
 
-    // Apply all sorts
-    if (this._sort) {
-      keys = Object.keys(this._sort);
-
-      // Going backwards so that the first sort is the last that gets applied
-      for (i = keys.length - 1; i >= 0; i -= 1) {
-        key = keys[i];
-        res.sort(function (a, b) {
-          return self._sort[key] * model.compareThings(model.getDotValue(a, key), model.getDotValue(b, key));
-        });
+  // Apply all sorts
+  if (this._sort) {
+    keys = Object.keys(this._sort);
+    
+    // Sorting
+    var criteria = [];
+    for (i = 0; i < keys.length; i++) {
+      key = keys[i];
+      criteria.push({ key: key, direction: self._sort[key] });
+    }
+    res.sort(function(a, b) {
+      var criterion, compare, i;
+      for (i = 0; i < criteria.length; i++) {
+        criterion = criteria[i];
+        compare = criterion.direction * model.compareThings(model.getDotValue(a, criterion.key), model.getDotValue(b, criterion.key));
+        if (compare !== 0) {
+          return compare;
+        }
       }
+      return 0;
+    });
+  }
+    
+  // Applying limit and skip
+  if (this._sort || this._group) {
+    var limit = this._limit || res.length,
+    skip = this._skip || 0;
 
-      // Applying limit and skip
-      var limit = this._limit || res.length,
-        skip = this._skip || 0;
+    res = res.slice(skip, skip + limit);
+  }
 
-      res = res.slice(skip, skip + limit);
-    }
-
-    if (this.execFn) {
-      return this.execFn(null, res, callback);
-    } else {
-      return callback(null, res);
-    }
+  if (this.execFn) {
+    return this.execFn(null, res, callback);
+  } else {
+    return callback(null, res);
   }
 };
 
 Cursor.prototype.exec = function () {
-  this.db.executor.push({
-    this: this,
-    fn: this._exec,
-    arguments: arguments
-  });
+  this.db.executor.push({ this: this, fn: this._exec, arguments: arguments });
 };
+
+
 
 // Interface
 module.exports = Cursor;
-},{"./model":9,"async":11}],5:[function(require,module,exports){
+},{"./model":9}],5:[function(require,module,exports){
 /**
  * Specific customUtils for the browser, where we don't have access to the Crypto and Buffer modules
  */
@@ -2527,6 +2495,105 @@ function matchQueryPart (obj, queryKey, queryValue, treatObjAsValue) {
   return true;
 }
 
+function aggregate(res, group) {
+  var nested = {},
+    flattened = [],
+        outKeys = [],
+        keys = null,
+    i, j, k, handle, sub, entry, nodeKeys;
+
+  if (!_.isFunction(group.reduce)) {
+    throw new Error("A reduce function must be provided.");
+  }
+
+  if (!group.initial) {
+    throw new Error("An initial vector must be provided.");
+  }
+
+  if (group.finalize && !_.isFunction(group.finalize)) {
+    throw new Error("'finalize', if provided, must be a function.");
+  }
+
+  if (group.key) {
+    keys = _.filter(_.keys(group.key), function (key) {
+      return group.key[key];
+    });
+    if (_.isEmpty(keys)) {
+      throw new Error("At least one key should be enabled.");
+    }
+    for (i = 0; i < keys.length; ++i) {
+      outKeys.push(keys[i].replace(/\./g, '_'));
+      keys[i] = keys[i].split('.');
+    }
+  }
+
+  if (keys) {
+    for (i = 0; i < res.length; ++i) {
+      handle = nested;
+      for (j = 0; j < keys.length; ++j) {
+        sub = _getValue(res[i], keys[j]);
+        if (!handle[sub]) {
+          if (j === keys.length - 1) {
+            handle[sub] = deepCopy(group.initial);
+          } else {
+            handle[sub] = {};
+          }
+        }
+        if (j === keys.length - 1) {
+          group.reduce(res[i], handle[sub]);
+        }
+        handle = handle[sub];
+      }
+    }
+
+    _walk(nested, 0, []);
+  }
+  else {
+    flattened = [_.reduce(res, function(memo, item){
+      group.reduce(item, memo);
+      return memo;
+    }, deepCopy(group.initial))];
+    group.finalize(flattened[0]);
+  }
+  return flattened;
+
+  function _getValue(item, key) {
+    try {
+      for (k = 0; k < key.length; ++k) {
+        item = item[key[k]];
+        if (k === key.length - 1) {
+          if (!isPrimitiveType(item) || util.isArray(item)) {
+            item = null;
+          }
+        }
+      }
+    } catch (err) {
+      item = null;
+    }
+    return item;
+  }
+
+  function _walk(node, depth, path) {
+    if (depth === keys.length) {
+      if (group.finalize) group.finalize(node);
+      entry = {};
+      for (i = 0; i < path.length; ++i) {
+        entry[outKeys[i]] = path[i];
+      }
+
+      nodeKeys = Object.keys(node);
+      for (i = 0; i < nodeKeys.length; ++i) {
+        entry[nodeKeys[i]] = node[nodeKeys[i]];
+      }
+
+      flattened.push(entry);
+    } else {
+      for (var key in node) {
+        _walk(node[key], depth + 1, path.concat([key]));
+      }
+    }
+  }
+}
 
 // Interface
 module.exports.serialize = serialize;
@@ -2539,7 +2606,7 @@ module.exports.getDotValue = getDotValue;
 module.exports.match = match;
 module.exports.areThingsEqual = areThingsEqual;
 module.exports.compareThings = compareThings;
-
+module.exports.aggregate = aggregate;
 },{"underscore":16,"util":2}],10:[function(require,module,exports){
 /**
  * Handle every persistence-related task
