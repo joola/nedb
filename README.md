@@ -35,6 +35,7 @@ It's a subset of MongoDB's API (the most used operations). The current API will 
   * <a href="#array-fields">Array fields</a>
   * <a href="#logical-operators-or-and-not-where">Logical operators $or, $and, $not, $where</a>
   * <a href="#sorting-and-paginating">Sorting and paginating</a>
+  * <a href="#group-pipeline">Group pipeline</a>
 * <a href="#counting-documents">Counting documents</a>
 * <a href="#updating-documents">Updating documents</a>
 * <a href="#removing-documents">Removing documents</a>
@@ -337,6 +338,9 @@ db.find({ system: 'solar' }).sort({ planet: -1 }).exec(function (err, docs) {
 db.find({}).sort({ firstField: 1, secondField: -1 }) ...   // You understand how this works!
 ```
 
+
+#### Group pipeline
+See <a href="https://github.com/louischatriot/nedb/pull/153">Issue</a> from <a href="https://github.com/adityamukho">@adityamukho</a>
 
 
 ### Counting documents
