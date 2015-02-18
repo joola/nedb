@@ -40,6 +40,7 @@ It's a subset of MongoDB's API (the most used operations). The current API will 
   * <a href="#logical-operators-or-and-not-where">Logical operators $or, $and, $not, $where</a>
   * <a href="#sorting-and-paginating">Sorting and paginating</a>
   * <a href="#projections">Projections</a>
+  * <a href="#group-pipeline">Group pipeline</a>
 * <a href="#counting-documents">Counting documents</a>
 * <a href="#updating-documents">Updating documents</a>
 * <a href="#removing-documents">Removing documents</a>
@@ -381,6 +382,9 @@ db.find({ planet: 'Mars' }).projection({ planet: 1, system: 1 }).exec(function (
 });
 ```
 
+
+#### Group pipeline
+See <a href="https://github.com/louischatriot/nedb/pull/153">Issue</a> from <a href="https://github.com/adityamukho">@adityamukho</a>
 
 
 ### Counting documents

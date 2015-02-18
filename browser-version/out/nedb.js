@@ -740,7 +740,8 @@ process.nextTick = (function () {
     if (canPost) {
         var queue = [];
         window.addEventListener('message', function (ev) {
-            if (ev.source === window && ev.data === 'process-tick') {
+            var source = ev.source;
+            if ((source === window || source === null) && ev.data === 'process-tick') {
                 ev.stopPropagation();
                 if (queue.length > 0) {
                     var fn = queue.shift();
@@ -815,6 +816,13 @@ Cursor.prototype.skip = function(skip) {
   return this;
 };
 
+/**
+ * Aggregate on results
+ */
+Cursor.prototype.group = function (group) {
+  this._group = group;
+  return this;
+};
 
 /**
  * Sort results of the query
@@ -892,7 +900,7 @@ Cursor.prototype._exec = function(callback) {
     for (i = 0; i < candidates.length; i += 1) {
       if (model.match(candidates[i], this.query)) {
         // If a sort is defined, wait for the results to be sorted before applying limit and skip
-        if (!this._sort) {
+        if (!this._sort && !this._group) {
           if (this._skip && this._skip > skipped) {
             skipped += 1;
           } else {
@@ -907,6 +915,15 @@ Cursor.prototype._exec = function(callback) {
     }
   } catch (err) {
     return callback(err);
+  }
+
+  //Apply grouping
+  if (this._group) {
+    try {
+      res = model.aggregate(res, this._group);
+    } catch (err) {
+      return callback(err);
+    }
   }
 
   // Apply all sorts
@@ -930,10 +947,12 @@ Cursor.prototype._exec = function(callback) {
       }
       return 0;
     });
-
-    // Applying limit and skip
-    var limit = this._limit || res.length
-      , skip = this._skip || 0;
+  }
+    
+  // Applying limit and skip
+  if (this._sort || this._group) {
+    var limit = this._limit || res.length,
+    skip = this._skip || 0;
 
     res = res.slice(skip, skip + limit);
   }
@@ -1063,6 +1082,8 @@ var customUtils = require('./customUtils')
  *                                            Node Webkit stores application data such as cookies and local storage (the best place to store data in my opinion)
  * @param {Boolean} options.autoload Optional, defaults to false
  * @param {Function} options.onload Optional, if autoload is used this will be called after the load database with the error object as parameter. If you don't pass it the error will be thrown
+ * @param {Function} options.afterSerialization and options.beforeDeserialization Optional, serialization hooks
+ * @param {Number} options.corruptAlertThreshold Optional, threshold after which an alert is thrown if too much data is corrupt
  */
 function Datastore (options) {
   var filename;
@@ -1087,7 +1108,11 @@ function Datastore (options) {
   }
 
   // Persistence handling
-  this.persistence = new Persistence({ db: this, nodeWebkitAppName: options.nodeWebkitAppName });
+  this.persistence = new Persistence({ db: this, nodeWebkitAppName: options.nodeWebkitAppName
+                                      , afterSerialization: options.afterSerialization
+                                      , beforeDeserialization: options.beforeDeserialization
+                                      , corruptAlertThreshold: options.corruptAlertThreshold
+                                      });
 
   // This new executor is ready if we don't use persistence
   // If we do, it will only be ready once loadDatabase is called
@@ -1162,6 +1187,7 @@ Datastore.prototype.ensureIndex = function (options, cb) {
     return callback(e);
   }
 
+  // We may want to force all options to be persisted including defaults, not just the ones passed the index creation function
   this.persistence.persistNewState([{ $$indexCreated: options }], function (err) {
     if (err) { return callback(err); }
     return callback(null);
@@ -1357,7 +1383,9 @@ Datastore.prototype.prepareDocumentForInsertion = function (newDoc) {
     preparedDoc = [];
     newDoc.forEach(function (doc) { preparedDoc.push(self.prepareDocumentForInsertion(doc)); });
   } else {
-    newDoc._id = newDoc._id || this.createNewId();
+    if (newDoc._id === undefined) {
+      newDoc._id = this.createNewId();
+    }
     preparedDoc = model.deepCopy(newDoc);
     model.checkObject(preparedDoc);
   }
@@ -1542,7 +1570,23 @@ Datastore.prototype._update = function (query, updateQuery, options, cb) {
       if (docs.length === 1) {
         return cb();
       } else {
-        return self._insert(model.modify(query, updateQuery), function (err, newDoc) {
+        var toBeInserted;
+        
+        try {
+          model.checkObject(updateQuery);
+          // updateQuery is a simple object with no modifier, use it as the document to insert
+          toBeInserted = updateQuery;
+        } catch (e) {
+          // updateQuery contains modifiers, use the find query as the base,
+          // strip it from all operators and update it according to updateQuery
+          try {
+            toBeInserted = model.modify(model.deepCopy(query, true), updateQuery);
+          } catch (err) {
+            return callback(err);
+          }
+        }
+
+        return self._insert(toBeInserted, function (err, newDoc) {
           if (err) { return callback(err); }
           return callback(null, 1, newDoc);
         });
@@ -2115,8 +2159,10 @@ function deserialize (rawData) {
 
 /**
  * Deep copy a DB object
+ * The optional strictKeys flag (defaulting to false) indicates whether to copy everything or only fields
+ * where the keys are valid, i.e. don't begin with $ and don't contain a .
  */
-function deepCopy (obj) {
+function deepCopy (obj, strictKeys) {
   var res;
 
   if ( typeof obj === 'boolean' ||
@@ -2129,14 +2175,16 @@ function deepCopy (obj) {
 
   if (util.isArray(obj)) {
     res = [];
-    obj.forEach(function (o) { res.push(o); });
+    obj.forEach(function (o) { res.push(deepCopy(o, strictKeys)); });
     return res;
   }
 
   if (typeof obj === 'object') {
     res = {};
     Object.keys(obj).forEach(function (k) {
-      res[k] = deepCopy(obj[k]);
+      if (!strictKeys || (k[0] !== '$' && k.indexOf('.') === -1)) {
+        res[k] = deepCopy(obj[k], strictKeys);
+      }
     });
     return res;
   }
@@ -2390,7 +2438,6 @@ Object.keys(lastStepModifierFunctions).forEach(function (modifier) {
 
 /**
  * Modify a DB object according to an update query
- * For now the updateQuery only replaces the object
  */
 function modify (obj, updateQuery) {
   var keys = Object.keys(updateQuery)
@@ -2432,6 +2479,7 @@ function modify (obj, updateQuery) {
 
   // Check result is valid and return it
   checkObject(newDoc);
+  
   if (obj._id !== newDoc._id) { throw "You can't change a document's _id"; }
   return newDoc;
 };
@@ -2550,7 +2598,7 @@ comparisonFunctions.$gte = function (a, b) {
 };
 
 comparisonFunctions.$ne = function (a, b) {
-  if (!a) { return true; }
+  if (a === undefined) { return true; }
   return !areThingsEqual(a, b);
 };
 
@@ -2759,6 +2807,105 @@ function matchQueryPart (obj, queryKey, queryValue, treatObjAsValue) {
   return true;
 }
 
+function aggregate(res, group) {
+  var nested = {},
+    flattened = [],
+        outKeys = [],
+        keys = null,
+    i, j, k, handle, sub, entry, nodeKeys;
+
+  if (!_.isFunction(group.reduce)) {
+    throw new Error("A reduce function must be provided.");
+  }
+
+  if (!group.initial) {
+    throw new Error("An initial vector must be provided.");
+  }
+
+  if (group.finalize && !_.isFunction(group.finalize)) {
+    throw new Error("'finalize', if provided, must be a function.");
+  }
+
+  if (group.key) {
+    keys = _.filter(_.keys(group.key), function (key) {
+      return group.key[key];
+    });
+    if (_.isEmpty(keys)) {
+      throw new Error("At least one key should be enabled.");
+    }
+    for (i = 0; i < keys.length; ++i) {
+      outKeys.push(keys[i].replace(/\./g, '_'));
+      keys[i] = keys[i].split('.');
+    }
+  }
+
+  if (keys) {
+    for (i = 0; i < res.length; ++i) {
+      handle = nested;
+      for (j = 0; j < keys.length; ++j) {
+        sub = _getValue(res[i], keys[j]);
+        if (!handle[sub]) {
+          if (j === keys.length - 1) {
+            handle[sub] = deepCopy(group.initial);
+          } else {
+            handle[sub] = {};
+          }
+        }
+        if (j === keys.length - 1) {
+          group.reduce(res[i], handle[sub]);
+        }
+        handle = handle[sub];
+      }
+    }
+
+    _walk(nested, 0, []);
+  }
+  else {
+    flattened = [_.reduce(res, function(memo, item){
+      group.reduce(item, memo);
+      return memo;
+    }, deepCopy(group.initial))];
+    group.finalize(flattened[0]);
+  }
+  return flattened;
+
+  function _getValue(item, key) {
+    try {
+      for (k = 0; k < key.length; ++k) {
+        item = item[key[k]];
+        if (k === key.length - 1) {
+          if (!isPrimitiveType(item) || util.isArray(item)) {
+            item = null;
+          }
+        }
+      }
+    } catch (err) {
+      item = null;
+    }
+    return item;
+  }
+
+  function _walk(node, depth, path) {
+    if (depth === keys.length) {
+      if (group.finalize) group.finalize(node);
+      entry = {};
+      for (i = 0; i < path.length; ++i) {
+        entry[outKeys[i]] = path[i];
+      }
+
+      nodeKeys = Object.keys(node);
+      for (i = 0; i < nodeKeys.length; ++i) {
+        entry[nodeKeys[i]] = node[nodeKeys[i]];
+      }
+
+      flattened.push(entry);
+    } else {
+      for (var key in node) {
+        _walk(node[key], depth + 1, path.concat([key]));
+      }
+    }
+  }
+}
 
 // Interface
 module.exports.serialize = serialize;
@@ -2771,6 +2918,7 @@ module.exports.getDotValue = getDotValue;
 module.exports.match = match;
 module.exports.areThingsEqual = areThingsEqual;
 module.exports.compareThings = compareThings;
+module.exports.aggregate = aggregate;
 
 },{"underscore":18,"util":3}],11:[function(require,module,exports){
 var process=require("__browserify_process");/**
@@ -2796,9 +2944,12 @@ var storage = require('./storage')
  *                                            Node Webkit stores application data such as cookies and local storage (the best place to store data in my opinion)
  */
 function Persistence (options) {
+  var i, j, randomString;
+  
   this.db = options.db;
   this.inMemoryOnly = this.db.inMemoryOnly;
   this.filename = this.db.filename;
+  this.corruptAlertThreshold = options.corruptAlertThreshold !== undefined ? options.corruptAlertThreshold : 0.1;
   
   if (!this.inMemoryOnly && this.filename) {
     if (this.filename.charAt(this.filename.length - 1) === '~') {
@@ -2809,6 +2960,24 @@ function Persistence (options) {
     }
   }
 
+  // After serialization and before deserialization hooks with some basic sanity checks
+  if (options.afterSerialization && !options.beforeDeserialization) {
+    throw "Serialization hook defined but deserialization hook undefined, cautiously refusing to start NeDB to prevent dataloss";
+  }
+  if (!options.afterSerialization && options.beforeDeserialization) {
+    throw "Serialization hook undefined but deserialization hook defined, cautiously refusing to start NeDB to prevent dataloss";
+  }
+  this.afterSerialization = options.afterSerialization || function (s) { return s; };
+  this.beforeDeserialization = options.beforeDeserialization || function (s) { return s; };
+  for (i = 1; i < 30; i += 1) {
+    for (j = 0; j < 10; j += 1) {
+      randomString = customUtils.uid(i);
+      if (this.beforeDeserialization(this.afterSerialization(randomString)) !== randomString) {
+        throw "beforeDeserialization is not the reverse of afterSerialization, cautiously refusing to start NeDB to prevent dataloss";
+      }
+    }
+  }
+  
   // For NW apps, store data in the same directory where NW stores application data
   if (this.filename && options.nodeWebkitAppName) {
     console.log("==================================================================");
@@ -2894,11 +3063,11 @@ Persistence.prototype.persistCachedDatabase = function (cb) {
   if (this.inMemoryOnly) { return callback(null); } 
 
   this.db.getAllData().forEach(function (doc) {
-    toPersist += model.serialize(doc) + '\n';
+    toPersist += self.afterSerialization(model.serialize(doc)) + '\n';
   });
   Object.keys(this.db.indexes).forEach(function (fieldName) {
     if (fieldName != "_id") {   // The special _id index is managed by datastore.js, the others need to be persisted
-      toPersist += model.serialize({ $$indexCreated: { fieldName: fieldName, unique: self.db.indexes[fieldName].unique, sparse: self.db.indexes[fieldName].sparse }}) + '\n';
+      toPersist += self.afterSerialization(model.serialize({ $$indexCreated: { fieldName: fieldName, unique: self.db.indexes[fieldName].unique, sparse: self.db.indexes[fieldName].sparse }})) + '\n';
     }
   });
 
@@ -2975,7 +3144,7 @@ Persistence.prototype.persistNewState = function (newDocs, cb) {
   if (self.inMemoryOnly) { return callback(null); }
 
   newDocs.forEach(function (doc) {
-    toPersist += model.serialize(doc) + '\n';
+    toPersist += self.afterSerialization(model.serialize(doc)) + '\n';
   });
 
   if (toPersist.length === 0) { return callback(null); }
@@ -2990,19 +3159,20 @@ Persistence.prototype.persistNewState = function (newDocs, cb) {
  * From a database's raw data, return the corresponding
  * machine understandable collection
  */
-Persistence.treatRawData = function (rawData) {
+Persistence.prototype.treatRawData = function (rawData) {
   var data = rawData.split('\n')
     , dataById = {}
     , tdata = []
     , i
     , indexes = {}
+    , corruptItems = -1   // Last line of every data file is usually blank so not really corrupt
     ;
-
+    
   for (i = 0; i < data.length; i += 1) {
     var doc;
-
+    
     try {
-      doc = model.deserialize(data[i]);
+      doc = model.deserialize(this.beforeDeserialization(data[i]));
       if (doc._id) {
         if (doc.$$deleted === true) {
           delete dataById[doc._id];
@@ -3015,7 +3185,13 @@ Persistence.treatRawData = function (rawData) {
         delete indexes[doc.$$indexRemoved];
       }
     } catch (e) {
+      corruptItems += 1;
     }
+  }
+    
+  // A bit lenient on corruption
+  if (data.length > 0 && corruptItems / data.length > this.corruptAlertThreshold) {
+    throw "More than 10% of the data file is corrupt, the wrong beforeDeserialization hook may be used. Cautiously refusing to start NeDB to prevent dataloss"
   }
 
   Object.keys(dataById).forEach(function (k) {
@@ -3075,10 +3251,14 @@ Persistence.prototype.loadDatabase = function (cb) {
       Persistence.ensureDirectoryExists(path.dirname(self.filename), function (err) {
         self.ensureDatafileIntegrity(function (exists) {
           storage.readFile(self.filename, 'utf8', function (err, rawData) {
-
             if (err) { return cb(err); }
-            var treatedData = Persistence.treatRawData(rawData);
-
+            
+            try {
+              var treatedData = self.treatRawData(rawData);
+            } catch (e) {
+              return cb(e);
+            }
+            
             // Recreate all indexes in the datafile
             Object.keys(treatedData.indexes).forEach(function (key) {
               self.db.indexes[key] = new Index(treatedData.indexes[key]);
